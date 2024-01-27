@@ -840,6 +840,9 @@ if (Seastar_DPDK)
       DPDK::dpdk)
 endif ()
 
+add_executable(ScalaTask src/ScalaTask.cpp)
+target_link_libraries(ScalaTask seastar)
+
 include (TriStateOption)
 tri_state_option (${Seastar_SANITIZE}
   DEFAULT_BUILD_TYPES "Debug" "Sanitize"
