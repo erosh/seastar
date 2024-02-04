@@ -1,16 +1,19 @@
-//
-// Created by erosh on 1/6/24.
-//
-
 #include <seastar/core/thread.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/file.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/util/file.hh>
+
 #include <seastar/http/httpd.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/http/json_path.hh>
 #include "json.hpp"
 #include <list>
+#include <memory>
 
 #include <seastar/coroutine/all.hh>
 
@@ -42,15 +45,25 @@ private:
 server_shutdown shutdown_control;
 
 class SimpleDB {
-public:
-    SimpleDB(const nlohmann::json &config) {
-        // Initialize cache size and database path from JSON
-        cache_size_ = config["cache_size"].get<uint64_t>();
-        db_path_ = config["db_path"].get<std::string>();
+    SimpleDB(const nlohmann::json &config) : cache_size_(config["cache_size"].get<uint64_t>()),
+                                             db_path_(config["db_path"].get<std::string>()) {}
 
-        // Load data from the database file
-        load_from_disk();
+public:
+    static future<std::unique_ptr<SimpleDB>> create(const nlohmann::json &config) {
+        auto db = std::unique_ptr<SimpleDB>(new SimpleDB(config));
+        return db->load_from_disk().then([db = std::move(db)]() mutable {
+            return std::move(db);
+        });
     }
+
+//    SimpleDB(const nlohmann::json &config) {
+//        // Initialize cache size and database path from JSON
+//        cache_size_ = config["cache_size"].get<uint64_t>();
+//        db_path_ = config["db_path"].get<std::string>();
+//
+//        // Load data from the database file
+//        load_from_disk();
+//    }
 
     ~SimpleDB() = default;
 
@@ -83,7 +96,7 @@ public:
             db_[key] = value;
 
             // Save data to disk (not called on every operation, but for example, on a timer or when needed)
-            save_to_disk();
+            return save_to_disk();
         });
     }
 
@@ -173,9 +186,10 @@ public:
                 keyToData_.erase(it);
             }
             size_t count = db_.erase(key);
-            save_to_disk();
-            // Return the number of erased elements to the caller
-            return count;
+            return save_to_disk().then([count] {
+                // Return the number of erased elements to the caller
+                return count;
+            });
         });
     }
 
@@ -188,11 +202,12 @@ public:
 
     future<> flush_and_stop() {
         // Async operation to flush data to disk and then release the semaphore
-        return with_semaphore(sem_, 1, [this] {
-            return seastar::async([this] {
-                save_to_disk();
-            });
+        //return with_semaphore(sem_, 1, [this] {
+        return seastar::async([this] {
+            save_to_disk();
         });
+        //return save_to_disk();
+        //});
     }
 
 private:
@@ -206,30 +221,72 @@ private:
     //mutable std::mutex mutex_;
     mutable seastar::semaphore sem_{1};
 
-    void load_from_disk() {
-        try {
-            // Read JSON data from file
-            std::ifstream file(db_path_);
-            if (file.is_open()) {
-                db_ = nlohmann::json::parse(file);
-                file.close();
+//    void load_from_disk() {
+//        try {
+//            // Read JSON data from file
+//            std::ifstream file(db_path_);
+//            if (file.is_open()) {
+//                db_ = nlohmann::json::parse(file);
+//                file.close();
+//            }
+//        } catch (const std::exception &e) {
+//            std::cerr << "Error loading data from disk: " << e.what() << std::endl;
+//        }
+//    }
+
+    future<> load_from_disk() {
+        return seastar::file_exists(db_path_.string()).then([this](bool exists) mutable {
+            return exists ? seastar::open_file_dma(db_path_.string(), seastar::open_flags::ro) : seastar::make_ready_future<seastar::file>();
+        }).then([this](seastar::file file) mutable {
+            if (!file) {
+                std::cerr << db_path_.string() << " does not exist, skipping load.\n";
+                return seastar::make_ready_future<>();
             }
-        } catch (const std::exception &e) {
-            std::cerr << "Error loading data from disk: " << e.what() << std::endl;
-        }
+            return file.stat().then([this, f = std::move(file)](struct stat sd) mutable {
+                return seastar::make_file_input_stream(std::move(f)).read_exactly(sd.st_size);
+            }).then([this](seastar::temporary_buffer<char> buf) mutable {
+                if (buf.empty()) {
+                    std::cerr << "Read an empty file.\n";
+                } else {
+                    db_ = nlohmann::json::parse(std::string_view(buf.begin(), buf.size()));
+                }
+                return seastar::make_ready_future<>();
+            });
+        }).handle_exception([](std::exception_ptr e) {
+            std::cerr << "Error loading data from disk: " << e << "\n";
+            return seastar::make_ready_future<>();
+        });
     }
 
-    void save_to_disk() {
-        try {
-            // Save JSON data to file
-            std::ofstream file(db_path_);
-            if (file.is_open()) {
-                file << std::setw(4) << db_ << std::endl;
-                file.close();
-            }
-        } catch (const std::exception &e) {
-            std::cerr << "Error saving data to disk: " << e.what() << std::endl;
-        }
+//    void save_to_disk() {
+//        try {
+//            // Save JSON data to file
+//            std::ofstream file(db_path_);
+//            if (file.is_open()) {
+//                file << std::setw(4) << db_ << std::endl;
+//                file.close();
+//            }
+//        } catch (const std::exception &e) {
+//            std::cerr << "Error saving data to disk: " << e.what() << std::endl;
+//        }
+//    }
+    future<> save_to_disk() {
+        const std::string data = db_.dump(4);
+        return seastar::open_file_dma(db_path_.string(), seastar::open_flags::rw | seastar::open_flags::create).then(
+                [this, data = std::move(data)](seastar::file f) {
+                    return seastar::do_with(std::move(f), [this, data = std::move(data)](seastar::file &f) {
+                        auto len = data.size();
+                        return f.dma_write(0, data.c_str(), len).then([len](size_t written) {
+                            if (written != len) {
+                                return seastar::make_exception_future<>(
+                                        std::runtime_error("Failed to save all data to disk"));
+                            }
+                            return seastar::make_ready_future<>();
+                        });
+                    });
+                }).handle_exception([](std::exception_ptr e) {
+            std::cerr << "Error saving data to disk: " << e << "\n";
+        });
     }
 };
 
@@ -424,8 +481,8 @@ int main(int argc, char **argv) {
                                std::string(options["input"].as<std::filesystem::path>()) + ": " + e.what());
     }
 
-    SimpleDB db(default_config);
-    auto server = std::make_unique<http_server_control>();
+    //SimpleDB db(default_config);
+
     app_template app;
     app.add_options()
             ("server-addr", boost::program_options::value<std::string>()->default_value(
@@ -433,11 +490,13 @@ int main(int argc, char **argv) {
                                  default_config.at("port").get<int>())),
              "IP address and port to listen on");
 
-    return app.run(argc, argv, [&app, &server, &db] -> future<int> {
+    return app.run(argc, argv, [&app, &default_config] -> future<int> {
+        std::unique_ptr<SimpleDB> db = co_await SimpleDB::create(default_config);
+        auto server = std::make_unique<http_server_control>();
         auto &config = app.configuration();
         std::string server_addr_str = config["server-addr"].as<std::string>();
         ipv4_addr addr{server_addr_str};
-        co_await server->start().then([&server, &db] {
+        co_await server->start().then([&server, &db = *db.get()] {
             return server->set_routes([&db](routes &r) {
                 set_routes(r, db);
             });
@@ -451,7 +510,8 @@ int main(int argc, char **argv) {
         co_await shutdown_control.await_shutdown();
         std::cout << "Seastar HTTP server shutting down...\n";
         co_await server->stop();
-        co_await db.flush_and_stop();
+        //co_await db.flush_and_stop();
+        seastar::engine().exit(0);
         co_return 0;
     });
 }
